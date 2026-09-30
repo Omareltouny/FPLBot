@@ -62,3 +62,8 @@ BENCH_WEIGHT = 0.12  # how much bench players' scores count in the squad optimis
 SELL_GAIN_MIN = 2.5  # /wildcard lite: SELL if a same-position swap gains at least this many points
 HIT_COST = 4
 MAX_TRANSFERS_SHOWN = 3
+
+# --- Phase 5 (no-payments release): free trial, then the app stops until payments exist ---
+TRIAL_GAMEWEEKS = int(os.getenv("TRIAL_GAMEWEEKS", "3"))  # length of the free trial, in gameweeks
+# Optional hard stop: the LAST gameweek the free trial works. If set it overrides TRIAL_GAMEWEEKS.
+TRIAL_END_GW = int(os.getenv("TRIAL_END_GW")) if os.getenv("TRIAL_END_GW", "").isdigit() else None

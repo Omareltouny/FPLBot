@@ -1,6 +1,6 @@
-# FPL Rival Tracker — Phases 1–4
+# FPL Rival Tracker — v5 (free trial release)
 
-A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and viewing your own squad. Phase 2 adds mini-league rival analysis, designed for **large leagues (20,000–50,000 managers)**. Phase 3 adds live tracking, alerts and chip prediction. Phase 4 adds the transfer and wildcard advisor, which tells you how to beat your rivals. Payments come in Phase 5.
+A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and viewing your own squad. Phase 2 adds mini-league rival analysis, designed for **large leagues (20,000–50,000 managers)**. Phase 3 adds live tracking, alerts and chip prediction. Phase 4 adds the transfer and wildcard advisor, which tells you how to beat your rivals. **Version 5 has no payments.** Instead everything is free for a 3-gameweek trial, and then the bot stops working until a payment method exists (see "Free trial and automatic shutdown").
 
 ## Commands
 
@@ -8,6 +8,7 @@ A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and vi
 |---|---|
 | `/start` | Introduces the bot and how to find your team ID |
 | `/setteam <team_id>` | Saves your FPL team ID (validated against the FPL API) |
+| `/status` | Shows the free-trial window and your access. Keeps working after the trial ends |
 | `/myteam` | Shows your total points, overall rank, and current squad (starting XI and bench, captain and vice marked) |
 | `/showleagues` | Lists the leagues on your FPL profile with their IDs |
 | `/trackleague <league_id>` | Starts tracking one (classic leagues only). `/addleague` still works as an old alias |
@@ -22,7 +23,18 @@ A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and vi
 | `/transfers [free_transfers] [off\|low\|med\|high]` | **Paid.** The best 1, 2 and 3 transfers with the points gain, the -4 hit for each extra transfer, and a verdict on whether it's worth it. Assumes 1 free transfer; `/transfers 2` if you have two |
 | `/alert` | **Paid.** Push alerts: `/alert on`, `/alert off`, `/alert rank <n>`, `/alert transfers on\|off` |
 
-Paid commands are available to `ADMIN_TELEGRAM_IDS` until payments arrive in Phase 5.
+Commands marked **Paid** are free for everyone during the trial. After the trial they (and every other command) stop working, except for admins in `ADMIN_TELEGRAM_IDS` and anyone an admin has granted access.
+
+## Free trial and automatic shutdown
+
+- **Everything is free for 3 gameweeks.** The trial is global: it starts at the gameweek when the bot first runs (FPL's current gameweek) and covers that gameweek plus the next two. For example, if the bot first runs during GW8, it works through GW8, GW9 and GW10.
+- **Then it stops.** The moment FPL's current gameweek moves past the last trial gameweek (at that gameweek's deadline), the bot refuses every command from non-admins with a "trial ended" message. Only `/start` and `/status` still answer, and both say the trial is over. The check runs before every command, so no handler, API call or alert runs for locked users.
+- **Who still works:** admins (`ADMIN_TELEGRAM_IDS`), and anyone an admin grants with `/grant <telegram_id> [days]`. `/revoke <telegram_id>` takes it away. Use this for friends and testers while payments are sorted out.
+- **Alerts** pause after the trial. Each alert subscriber gets one message saying so.
+- **Last free gameweek:** during it, replies to non-admins end with a note that the trial ends after that gameweek.
+- **If the FPL API is down,** the bot uses the last known gameweek and never re-opens a finished trial. If the API is down on the very first launch, the trial simply starts on the next successful check.
+- **Settings in `.env`:** `TRIAL_GAMEWEEKS=3` sets the length (read the first time the bot runs). `TRIAL_END_GW=<n>` pins the last free gameweek and overrides everything: raise it and restart to extend the trial, lower it to stop sooner. Check the current state any time with `/status`.
+- The trial start and end gameweeks live in the `settings` table of the SQLite file. Delete the file (or its `trial_*` rows) to restart the trial.
 
 ## How it handles 20k–50k manager leagues
 
@@ -127,13 +139,14 @@ The bot uses polling, so no webhook, domain or open port is needed. In Telegram,
 pytest
 ```
 
-Tests use mocked FPL responses, including a simulated 50,000-manager league (retry logic, caching, database, admin bypass, league scope, chips, auto-subs, live projections, chip prediction, alerts, the scoring model, the optimiser, and the Telegram handlers end to end). They never call the live API or Telegram. They do not call the live API or Telegram.
+Tests use mocked FPL responses, including a simulated 50,000-manager league (retry logic, caching, database, admin bypass, league scope, chips, auto-subs, live projections, chip prediction, alerts, the scoring model, the optimiser, the trial gate pushed through the real Telegram dispatcher, and the Telegram handlers end to end). They never call the live API or Telegram. They do not call the live API or Telegram.
 
 ## Project layout
 
 ```
 main.py          Bot entry point and command handlers
 fpl_client.py    Async FPL API client (User-Agent, retries, cache)
+access.py        Free trial window, hard stop after it, who has access
 advisor.py       Player scoring model, sell prices, lineups
 optimize.py      Exact squad optimiser (wildcard and 1-3 transfers)
 advice.py        /wildcard and /transfers answers
@@ -161,4 +174,4 @@ Alerts only fire while the bot process is running, so run it as a `systemd` serv
 
 ## Roadmap
 
-- Phase 5: Telegram Stars payments, free/paid gating, `/upgrade`
+- Payments: not built. Undecided. Telegram Stars pays out in crypto and Stripe doesn't list Egypt as a supported country, so the provider needs choosing first. The access layer (`access.py`, `users.subscribed` and expiry) is ready for a payment step to plug into.

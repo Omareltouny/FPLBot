@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS rival_snapshots (
     chips_used_json TEXT,
     fetched_at TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS alert_subs (
     telegram_id INTEGER PRIMARY KEY,
     league_id INTEGER,
@@ -175,3 +179,34 @@ def prune_snapshots(keep_from_gw: int, path: str | None = None) -> int:
     """Drop cached squads from old gameweeks so the table doesn't grow every round."""
     with connect(path) as conn:
         return conn.execute("DELETE FROM rival_snapshots WHERE gameweek < ?", (keep_from_gw,)).rowcount
+
+
+# ---------------------------------------------------------------- settings
+def get_setting(key: str, path: str | None = None) -> str | None:
+    with connect(path) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def set_setting(key: str, value: str, path: str | None = None) -> None:
+    with connect(path) as conn:
+        conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+
+def grant_subscription(telegram_id: int, days: int, path: str | None = None) -> str:
+    """Manually give someone paid access for N days (admin tool until real payments exist)."""
+    from datetime import timedelta
+    expires = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    with connect(path) as conn:
+        conn.execute(
+            "INSERT INTO users (telegram_id, subscribed, subscription_expires_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET subscribed = 1, subscription_expires_at = excluded.subscription_expires_at",
+            (telegram_id, expires))
+    return expires
+
+
+def revoke_subscription(telegram_id: int, path: str | None = None) -> None:
+    with connect(path) as conn:
+        conn.execute("UPDATE users SET subscribed = 0, subscription_expires_at = NULL WHERE telegram_id = ?",
+                     (telegram_id,))

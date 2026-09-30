@@ -13,6 +13,7 @@ from telegram.constants import ParseMode
 from telegram.error import Forbidden
 from telegram.ext import ContextTypes
 
+import access
 import config
 import db
 import league
@@ -76,7 +77,15 @@ async def _fetch_transfers(fpl: FPLClient, ids: list[int], cache: dict[int, list
 async def process_subscription(bot, fpl: FPLClient, sub, players: dict, cache: dict,
                                db_path: str | None = None) -> None:
     tid = sub["telegram_id"]
-    if not db.is_subscribed(tid, db_path):
+    if not access.has_access(tid, db_path):
+        # trial is over: say so once, then stay quiet
+        if not db.get_setting(f"alerts_paused_notified:{tid}", db_path):
+            db.set_setting(f"alerts_paused_notified:{tid}", "1", db_path)
+            try:
+                await bot.send_message(chat_id=tid, text="⏹ Your free trial has ended, so alerts are paused. "
+                                       "I'll announce when paid plans launch.")
+            except Forbidden:
+                db.upsert_alert(tid, db_path, enabled=0)
         return
     user = db.get_user(tid, db_path)
     if not user or not user["fpl_team_id"]:
@@ -108,6 +117,7 @@ async def process_subscription(bot, fpl: FPLClient, sub, players: dict, cache: d
 
 async def alert_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     fpl: FPLClient = context.application.bot_data["fpl"]
+    await access.refresh(fpl)  # keeps the trial state current even if nobody typed a command
     subs = db.active_alerts()
     if not subs:
         return

@@ -1,13 +1,14 @@
-"""FPL Rival Tracker — Telegram bot (Phases 1-4)."""
+"""FPL Rival Tracker — Telegram bot (Phases 1-5)."""
 import asyncio
 import html
 import logging
 
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, ContextTypes, TypeHandler
 
 import config
+import access
 import advice
 import advisor
 import alerts
@@ -67,7 +68,11 @@ def format_squad(picks: list[dict], players: dict[int, dict], teams: dict[int, d
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML)
+    state = await access.refresh(context.application.bot_data["fpl"])
+    if access.is_locked(update.effective_user.id, state=state):
+        await update.message.reply_text(access.denied_message(state))
+        return
+    await update.message.reply_text(WELCOME + "\n\n" + access.trial_line(state), parse_mode=ParseMode.HTML)
 
 
 async def setteam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,11 +134,13 @@ async def myteam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ------------------------------------------------------------------ Phase 2
-PAYWALL = "🔒 This is a paid feature. Payments are coming soon — for now it's available to admins only."
 
 
 async def send_sections(update: Update, sections: list[str], limit: int = 3800) -> None:
     """Pack sections into Telegram-sized messages (4096 char cap)."""
+    footer = access.footer_for(update.effective_user.id) if update.effective_user else ""
+    if footer and sections:
+        sections = sections[:-1] + [sections[-1] + footer]
     chunk = ""
     for sec in sections:
         sec = sec[:limit]
@@ -255,8 +262,8 @@ async def _scan(context: ContextTypes.DEFAULT_TYPE, team_id: int, league_id: int
 
 
 async def _paid_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, builder) -> None:
-    if not db.is_subscribed(update.effective_user.id):
-        await update.message.reply_text(PAYWALL)
+    if not access.has_access(update.effective_user.id):
+        await update.message.reply_text(access.denied_message())
         return
     res = await _resolve(update, context.args[0] if context.args else None)
     if not res:
@@ -333,8 +340,8 @@ async def rival(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------------ Phase 3
 async def _paid_run(update: Update, context: ContextTypes.DEFAULT_TYPE, runner) -> None:
     """Shared wrapper: paywall, league resolution, friendly API errors. runner(league_row, team_id) -> sections."""
-    if not db.is_subscribed(update.effective_user.id):
-        await update.message.reply_text(PAYWALL)
+    if not access.has_access(update.effective_user.id):
+        await update.message.reply_text(access.denied_message())
         return
     res = await _resolve(update, next((a for a in context.args if a.isdigit() and int(a) > 100), None))
     if not res:
@@ -404,8 +411,8 @@ ALERT_HELP = (
 
 async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    if not db.is_subscribed(uid):
-        await update.message.reply_text(PAYWALL)
+    if not access.has_access(uid):
+        await update.message.reply_text(access.denied_message())
         return
     args = [a.lower() for a in context.args]
     sub = db.get_alert(uid)
@@ -448,8 +455,8 @@ async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _advisor_run(update: Update, context: ContextTypes.DEFAULT_TYPE, diff: str, build) -> None:
     """Paywall, gather squad + rival ownership + prices, then `await build(plan, sample_note)`."""
     uid = update.effective_user.id
-    if not db.is_subscribed(uid):
-        await update.message.reply_text(PAYWALL)
+    if not access.has_access(uid):
+        await update.message.reply_text(access.denied_message())
         return
     user = db.get_user(uid)
     if not user or not user["fpl_team_id"]:
@@ -509,6 +516,70 @@ async def transfers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _advisor_run(update, context, diff, lambda plan, sample: advice.build_transfers(plan, ft, sample))
 
 
+# ---------------------------------------------------------- trial gate (Phase 5)
+ALWAYS_ALLOWED = {"start", "status"}
+
+
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every handler. Once the free trial is over, everything but /start and /status is
+    refused for anyone who isn't an admin or manually granted access."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not (msg.text or "").startswith("/"):
+        return
+    cmd = msg.text.split()[0][1:].split("@")[0].lower()
+    if cmd in ALWAYS_ALLOWED or access.is_admin(user.id):
+        return
+    state = await access.refresh(context.application.bot_data["fpl"])
+    if access.is_locked(user.id, state=state):
+        await msg.reply_text(access.denied_message(state))
+        raise ApplicationHandlerStop
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    state = await access.refresh(context.application.bot_data["fpl"])
+    lines = [access.trial_line(state)]
+    if access.is_admin(uid):
+        lines.append("You're an admin: full access, always.")
+    else:
+        user = db.get_user(uid)
+        if user and user["subscribed"] and db.is_subscribed(uid):
+            lines.append("You have full access" + (f" until {user['subscription_expires_at'][:10]}." if user["subscription_expires_at"] else "."))
+        elif access.is_locked(uid, state=state):
+            lines.append("The bot is paused for you until paid plans launch.")
+    await update.message.reply_text("\n".join(lines))
+
+
+def _admin_target(update: Update, args: list[str]):
+    if not access.is_admin(update.effective_user.id):
+        return None
+    return int(args[0]) if args and args[0].isdigit() else None
+
+
+async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /grant <telegram_id> [days=30] — give someone full access by hand."""
+    if not access.is_admin(update.effective_user.id):
+        return  # silently ignore: don't reveal admin commands
+    target = _admin_target(update, context.args)
+    if target is None:
+        await update.message.reply_text("Usage: /grant <telegram_id> [days=30]")
+        return
+    days = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 30
+    expires = db.grant_subscription(target, days)
+    await update.message.reply_text(f"✅ {target} has full access until {expires[:10]}.")
+
+
+async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not access.is_admin(update.effective_user.id):
+        return
+    target = _admin_target(update, context.args)
+    if target is None:
+        await update.message.reply_text("Usage: /revoke <telegram_id>")
+        return
+    db.revoke_subscription(target)
+    await update.message.reply_text(f"Access revoked for {target}.")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
@@ -517,6 +588,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 COMMAND_MENU = [
     BotCommand("start", "How this bot works"),
+    BotCommand("status", "Your free-trial / access status"),
     BotCommand("setteam", "Set your FPL team ID"),
     BotCommand("myteam", "Your squad, points and rank"),
     BotCommand("showleagues", "List your leagues and their IDs"),
@@ -550,7 +622,11 @@ async def post_shutdown(app: Application) -> None:
 
 def build_app() -> Application:
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app.add_handler(TypeHandler(Update, gate), group=-1)  # trial gate runs before everything else
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("grant", grant))
+    app.add_handler(CommandHandler("revoke", revoke))
     app.add_handler(CommandHandler("setteam", setteam))
     app.add_handler(CommandHandler("myteam", myteam))
     app.add_handler(CommandHandler("showleagues", showleagues))
