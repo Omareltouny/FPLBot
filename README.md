@@ -1,6 +1,6 @@
-# FPL Rival Tracker — Phases 1–3
+# FPL Rival Tracker — Phases 1–4
 
-A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and viewing your own squad. Phase 2 adds mini-league rival analysis, designed for **large leagues (20,000–50,000 managers)**. Phase 3 adds live tracking, alerts and chip prediction. Payments come in Phase 4.
+A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and viewing your own squad. Phase 2 adds mini-league rival analysis, designed for **large leagues (20,000–50,000 managers)**. Phase 3 adds live tracking, alerts and chip prediction. Phase 4 adds the transfer and wildcard advisor, which tells you how to beat your rivals. Payments come in Phase 5.
 
 ## Commands
 
@@ -18,9 +18,11 @@ A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and vi
 | `/livewinprob [league_id]` | **Paid.** During a gameweek: live score, projected final total and gap for you and each rival, plus "you're ahead of N of M rivals" |
 | `/roundprize [n] [league_id]` | **Paid.** Live leaderboard for this gameweek among the top n managers (default 20, max 100) |
 | `/predictchip [league_id]` | **Paid.** Which rivals may play a chip soon, plus chips about to expire |
+| `/wildcard [lite\|full] [off\|low\|med\|high]` | **Paid.** Plans your wildcard. `full` (default) builds the best 15-man squad within your budget and marks every player KEEP, BUY or SELL, with XI, bench and captain. `lite` just labels your current players SELL or KEEP with the best swap for each, plus top buy targets. The last word sets how hard to chase differentials |
+| `/transfers [free_transfers] [off\|low\|med\|high]` | **Paid.** The best 1, 2 and 3 transfers with the points gain, the -4 hit for each extra transfer, and a verdict on whether it's worth it. Assumes 1 free transfer; `/transfers 2` if you have two |
 | `/alert` | **Paid.** Push alerts: `/alert on`, `/alert off`, `/alert rank <n>`, `/alert transfers on\|off` |
 
-Paid commands are available to `ADMIN_TELEGRAM_IDS` until payments arrive in Phase 4.
+Paid commands are available to `ADMIN_TELEGRAM_IDS` until payments arrive in Phase 5.
 
 ## How it handles 20k–50k manager leagues
 
@@ -99,19 +101,42 @@ The bot uses polling, so no webhook, domain or open port is needed. In Telegram,
 
 **Alerts** run in the background while the bot is running (every 15 minutes by default). `/alert on` picks the league; the first check only records a baseline, so you only hear about changes after that. You get a message when a rival in your sample makes a transfer, and when your league rank moves by your chosen number of places (default 5, set with `/alert rank <n>`). Transfer checks cost one API call per rival in the sample, shared between everyone watching the same manager.
 
+## Transfer and wildcard advisor (Phase 4)
+
+**How players are scored** (expected points over the next 5 gameweeks):
+
+1. Base rate per gameweek = 50% FPL form + 35% season points per game + 15% points per £m (cheap productive players get a nudge).
+2. Multiplied by fixture difficulty for each gameweek. Double gameweeks add both fixtures and blanks score zero.
+3. Reduced for injuries and doubts (mainly the next two gameweeks) and for rotation risk (players who start less than about 75% of available minutes).
+4. Later gameweeks count slightly less.
+5. **Differential bonus:** players your rivals don't own get a boost, scaled by how many of your sampled rivals own them. `off`, `low`, `med` (default) or `high` set the strength (0%, 5%, 12% or 25% for a player none of your rivals own). With no tracked league there are no rival data and no bonus.
+
+**The optimiser** is exact, not a greedy guess. It uses a mixed-integer programme (SciPy's HiGHS solver) to choose a legal squad (2 GK, 5 DEF, 5 MID, 3 FWD, max 3 per club) within budget, a starting XI in a legal formation, and a captain. The same model with a cap on how many players may change gives the 1, 2 and 3 transfer options. Points per million is handled by the budget constraint.
+
+**Budget and prices:** your budget is what you'd get for your current players plus your bank. Selling prices follow FPL's rule (half of any price rise, rounded down, full loss on a fall) and are worked out from your transfer history and season-start prices.
+
+**Limits you should know about:**
+- The public FPL API shows your squad as at the last gameweek deadline. Transfers you've already made for the next gameweek aren't visible, so the advisor plans from that squad.
+- Your bank comes from that same deadline snapshot.
+- Free transfers aren't read from the API. `/transfers` assumes 1, or pass the number.
+- This is a transparent form-and-fixtures model, not a guarantee. Weights and thresholds are in `config.py` (`W_FORM`, `W_PPG`, `W_VALUE`, `FDR_MULT`, `DIFF_LEVELS`, `SELL_GAIN_MIN` and others).
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-Tests use mocked FPL responses, including a simulated 50,000-manager league (retry logic, caching, database, admin bypass, league scope, chips, auto-subs, live projections, chip prediction, alerts, and the Telegram handlers end to end). They never call the live API or Telegram. They do not call the live API or Telegram.
+Tests use mocked FPL responses, including a simulated 50,000-manager league (retry logic, caching, database, admin bypass, league scope, chips, auto-subs, live projections, chip prediction, alerts, the scoring model, the optimiser, and the Telegram handlers end to end). They never call the live API or Telegram. They do not call the live API or Telegram.
 
 ## Project layout
 
 ```
 main.py          Bot entry point and command handlers
 fpl_client.py    Async FPL API client (User-Agent, retries, cache)
+advisor.py       Player scoring model, sell prices, lineups
+optimize.py      Exact squad optimiser (wildcard and 1-3 transfers)
+advice.py        /wildcard and /transfers answers
 league.py        League scope, squad/chip snapshots, analysis and report formatting
 live.py          Live scores, auto-subs, projections, /livewinprob and /roundprize
 predict.py       Chip prediction
@@ -136,4 +161,4 @@ Alerts only fire while the bot process is running, so run it as a `systemd` serv
 
 ## Roadmap
 
-- Phase 4: Telegram Stars payments, free/paid gating, `/upgrade`
+- Phase 5: Telegram Stars payments, free/paid gating, `/upgrade`

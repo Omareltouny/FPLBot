@@ -47,3 +47,18 @@ CHIP_HORIZON_GWS = 6  # how many upcoming gameweeks /predictchip looks at
 BB_DOUBLE_MIN = 6  # squad players with a double fixture for a Bench Boost flag
 FH_BLANK_MIN = 4  # starters with no fixture for a Free Hit flag
 CHIP_EXPIRY_WARN_GWS = 3  # chip window closing within N gameweeks => flag
+
+# --- Phase 4: transfer & wildcard advisor (all weights tunable) ---
+ADVISOR_HORIZON_GWS = 5  # look this many gameweeks ahead
+ADVISOR_DECAY = 0.92  # later gameweeks count slightly less
+W_FORM = 0.50  # weight of FPL's recent "form" (avg points, last few games)
+W_PPG = 0.35  # weight of season points per game
+W_VALUE = 0.15  # weight of points per million (cheap, productive players get a nudge)
+FDR_MULT = {1: 1.25, 2: 1.12, 3: 1.00, 4: 0.88, 5: 0.75}  # fixture difficulty -> points multiplier
+MINUTES_FULL_FRACTION = 0.75  # starting >= 75% of available minutes = no rotation penalty
+DIFF_LEVELS = {"off": 0.0, "low": 0.05, "med": 0.12, "high": 0.25}  # bonus for players few rivals own
+DIFF_DEFAULT = "med"
+BENCH_WEIGHT = 0.12  # how much bench players' scores count in the squad optimiser
+SELL_GAIN_MIN = 2.5  # /wildcard lite: SELL if a same-position swap gains at least this many points
+HIT_COST = 4
+MAX_TRANSFERS_SHOWN = 3

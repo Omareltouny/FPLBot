@@ -1,4 +1,4 @@
-"""FPL Rival Tracker — Telegram bot (Phases 1-3)."""
+"""FPL Rival Tracker — Telegram bot (Phases 1-4)."""
 import asyncio
 import html
 import logging
@@ -8,10 +8,13 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import config
+import advice
+import advisor
 import alerts
 import db
 import league
 import live
+import optimize
 import predict
 from fpl_client import FPLClient, FPLError, FPLNotFound
 
@@ -38,7 +41,9 @@ WELCOME = (
     "/livewinprob — live projected score vs your rivals\n"
     "/roundprize — live leaderboard for this gameweek\n"
     "/predictchip — which rivals may chip soon\n"
-    "/alert — rival transfer and rank-change alerts\n\n"
+    "/alert — rival transfer and rank-change alerts\n"
+    "/wildcard [lite|full] [low|med|high] — plan your wildcard: who to buy, sell, keep\n"
+    "/transfers [free transfers] — best 1-3 transfers and whether each hit is worth it\n\n"
     "Also: /myleagues, /removeleague &lt;id&gt;"
 )
 
@@ -439,6 +444,71 @@ async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "every check, so the list follows the standings each round.\n\n" + ALERT_HELP, parse_mode=ParseMode.HTML)
 
 
+# ------------------------------------------------------------------ Phase 4
+async def _advisor_run(update: Update, context: ContextTypes.DEFAULT_TYPE, diff: str, build) -> None:
+    """Paywall, gather squad + rival ownership + prices, then `await build(plan, sample_note)`."""
+    uid = update.effective_user.id
+    if not db.is_subscribed(uid):
+        await update.message.reply_text(PAYWALL)
+        return
+    user = db.get_user(uid)
+    if not user or not user["fpl_team_id"]:
+        await update.message.reply_text("Set your team first: /setteam <team_id>")
+        return
+    my_id = user["fpl_team_id"]
+    leagues = db.get_leagues(uid)
+    league_arg = next((a for a in context.args if a.isdigit() and int(a) > 100), None)
+    lg = next((l for l in leagues if str(l["league_id"]) == league_arg), None) if league_arg else (leagues[0] if leagues else None)
+    await update.message.reply_text("🧮 Crunching form, fixtures and your rivals' squads — this can take ~20 seconds…")
+    fpl: FPLClient = context.application.bot_data["fpl"]
+    try:
+        fixtures = await fpl.fixtures()
+        shares, sample = None, None
+        if lg:
+            scope, snaps, failed, boot, gw = await _scan(context, my_id, lg["league_id"])
+            my_snap = snaps.get(my_id) or await league.load_snapshot(fpl, lg["league_id"], my_id, gw)
+            shares = advice.own_share(snaps, my_id)
+            sample = league.sample_note(scope, snaps, failed)
+        else:
+            gw = await fpl.current_gameweek()
+            boot = await fpl.bootstrap()
+            my_snap = await league.load_snapshot(fpl, 0, my_id, gw)
+        try:
+            transfers = await fpl.transfers(my_id)
+        except FPLError:
+            transfers = None  # sell prices fall back to current prices, and the report says so
+        nxt = advisor.next_gameweek(boot)
+        chip_ok = "wildcard" in league.chips_available(boot, my_snap.chips, nxt)
+        plan = advice.make_plan(boot, fixtures, my_snap, transfers, shares, diff, gw, chip_ok)
+        sections = await asyncio.to_thread(build, plan, sample)
+    except optimize.NoSolution:
+        await update.message.reply_text("I couldn't build a valid squad within your budget. Try again after the next price update.")
+        return
+    except FPLNotFound:
+        await update.message.reply_text("I couldn't load your team or league. Check /setteam and /trackleague.")
+        return
+    except FPLError:
+        await update.message.reply_text("The FPL API is unavailable right now. Try again in a few minutes.")
+        return
+    await send_sections(update, sections)
+
+
+async def wildcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/wildcard [lite|full] [off|low|med|high] — plan a wildcard, optionally chasing differentials harder."""
+    args = [a.lower() for a in context.args]
+    view = "lite" if "lite" in args else "full"
+    diff = next((a for a in args if a in config.DIFF_LEVELS), config.DIFF_DEFAULT)
+    await _advisor_run(update, context, diff, lambda plan, sample: advice.build_wildcard(plan, view, sample))
+
+
+async def transfers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/transfers [free_transfers] [off|low|med|high] — best 1-3 transfers with a hit check."""
+    args = [a.lower() for a in context.args]
+    ft = next((int(a) for a in args if a.isdigit() and 1 <= int(a) <= 5), 1)
+    diff = next((a for a in args if a in config.DIFF_LEVELS), config.DIFF_DEFAULT)
+    await _advisor_run(update, context, diff, lambda plan, sample: advice.build_transfers(plan, ft, sample))
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
@@ -459,6 +529,8 @@ COMMAND_MENU = [
     BotCommand("roundprize", "Live gameweek leaderboard (paid)"),
     BotCommand("predictchip", "Who may chip soon (paid)"),
     BotCommand("alert", "Rival transfer / rank alerts (paid)"),
+    BotCommand("wildcard", "Plan your wildcard: buy, sell, keep (paid)"),
+    BotCommand("transfers", "Best 1-3 transfers + hit check (paid)"),
 ]
 
 
@@ -493,6 +565,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("roundprize", roundprize))
     app.add_handler(CommandHandler("predictchip", predictchip))
     app.add_handler(CommandHandler("alert", alert))
+    app.add_handler(CommandHandler("wildcard", wildcard))
+    app.add_handler(CommandHandler("transfers", transfers))
     app.add_error_handler(error_handler)
     if app.job_queue:
         app.job_queue.run_repeating(alerts.alert_tick, interval=config.ALERT_INTERVAL_MINUTES * 60, first=60)
