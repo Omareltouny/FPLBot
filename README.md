@@ -1,6 +1,6 @@
-# FPL Rival Tracker — Phases 1–2
+# FPL Rival Tracker — Phases 1–3
 
-A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and viewing your own squad. Phase 2 adds mini-league rival analysis, designed for **large leagues (20,000–50,000 managers)**. Live tracking, alerts and payments come in later phases.
+A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and viewing your own squad. Phase 2 adds mini-league rival analysis, designed for **large leagues (20,000–50,000 managers)**. Phase 3 adds live tracking, alerts and chip prediction. Payments come in Phase 4.
 
 ## Commands
 
@@ -9,11 +9,16 @@ A Telegram bot for Fantasy Premier League managers. Phase 1 is onboarding and vi
 | `/start` | Introduces the bot and how to find your team ID |
 | `/setteam <team_id>` | Saves your FPL team ID (validated against the FPL API) |
 | `/myteam` | Shows your total points, overall rank, and current squad (starting XI and bench, captain and vice marked) |
-| `/addleague` | With no argument, lists your leagues and their IDs. `/addleague <league_id>` starts tracking one (classic leagues only) |
+| `/showleagues` | Lists the leagues on your FPL profile with their IDs |
+| `/trackleague <league_id>` | Starts tracking one (classic leagues only). `/addleague` still works as an old alias |
 | `/myleagues`, `/removeleague <id>` | List or remove tracked leagues. Commands use the first tracked league unless you pass an ID |
 | `/rival <name or team_id>` | **Free.** Your squad vs one rival: shared players, who owns what only, captains |
 | `/leaguescan [league_id]` | **Paid.** Rank and point gap vs rivals, premium players you don't own, chips rivals still have |
 | `/differentials [league_id]` | **Paid.** Your low-ownership players, and popular players you're missing |
+| `/livewinprob [league_id]` | **Paid.** During a gameweek: live score, projected final total and gap for you and each rival, plus "you're ahead of N of M rivals" |
+| `/roundprize [n] [league_id]` | **Paid.** Live leaderboard for this gameweek among the top n managers (default 20, max 100) |
+| `/predictchip [league_id]` | **Paid.** Which rivals may play a chip soon, plus chips about to expire |
+| `/alert` | **Paid.** Push alerts: `/alert on`, `/alert off`, `/alert rank <n>`, `/alert transfers on\|off` |
 
 Paid commands are available to `ADMIN_TELEGRAM_IDS` until payments arrive in Phase 4.
 
@@ -26,9 +31,11 @@ A 50k league is 1,000 standings pages, so the bot never scans a whole league. It
 
 then fetches squads and chip history only for those ~30 managers, at most 6 requests at a time. Squads are cached in SQLite for 30 minutes and standings pages for 10 minutes, and the bootstrap data for an hour, so repeat commands are fast. Every report states what the sample is, and ownership percentages are percentages of that sample, not of the whole league.
 
+**Rivals refresh themselves every round.** Nothing is stored as a fixed rival list. Each scan and each alert check re-reads the live standings (cached 10 minutes) and re-picks the top 20 and your neighbours, so as ranks move the sample moves with them. Old cached squads are pruned automatically.
+
 `/rival <name>` only searches that sample. For anyone else, use `/rival <team_id>` (the ID is in their Points-tab URL).
 
-Tunable in `.env`: `LEAGUE_TOP_N` (max 50), `LEAGUE_NEIGHBORS`, `MAX_CONCURRENCY`.
+Tunable in `.env`: `LEAGUE_TOP_N` (max 50), `LEAGUE_NEIGHBORS`, `MAX_CONCURRENCY`, `ALERT_INTERVAL_MINUTES`.
 
 Chips: availability is read from the `chips` windows in the FPL data when present, so it follows the season's rules (for example chips split across halves of the season). If those windows are missing, the bot assumes one of each chip for the season.
 
@@ -82,13 +89,23 @@ python main.py
 
 The bot uses polling, so no webhook, domain or open port is needed. In Telegram, message your bot: `/start`, `/setteam <your id>`, `/myteam`.
 
+## Live tracking, chip prediction and alerts (Phase 3)
+
+**Live numbers** come from FPL's live feed, cached for 2 minutes, so repeated commands never hammer the API. A manager's live score applies captain/vice-captain rules, Bench Boost, transfer hits, and auto-subs once a player's match is over. The projected total adds FPL's own expected points for players still to play (scaled by minutes left in live matches, and split across double-gameweek fixtures). Bonus points may be provisional, so treat the projection as an estimate. Leagues that started mid-season are handled (points are counted from the league's start gameweek).
+
+**`/roundprize`** only looks at the top n managers by league rank, because finding the best score in a 50,000-manager league would need every page. The winner of a round can sit outside that group, and the report says so.
+
+**`/predictchip`** uses transparent rules on squads as they are today: Bench Boost when 6+ of a rival's 15 have a double fixture, Triple Captain when their captain has a double, Free Hit when 4+ starters have no fixture, and a flag for any unused chip whose window closes within 3 gameweeks. Thresholds live in `config.py`.
+
+**Alerts** run in the background while the bot is running (every 15 minutes by default). `/alert on` picks the league; the first check only records a baseline, so you only hear about changes after that. You get a message when a rival in your sample makes a transfer, and when your league rank moves by your chosen number of places (default 5, set with `/alert rank <n>`). Transfer checks cost one API call per rival in the sample, shared between everyone watching the same manager.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-Tests use mocked FPL responses, including a simulated 50,000-manager league (retry logic, caching, database, admin bypass, league scope, chips, reports). They do not call the live API or Telegram.
+Tests use mocked FPL responses, including a simulated 50,000-manager league (retry logic, caching, database, admin bypass, league scope, chips, auto-subs, live projections, chip prediction, alerts, and the Telegram handlers end to end). They never call the live API or Telegram. They do not call the live API or Telegram.
 
 ## Project layout
 
@@ -96,6 +113,9 @@ Tests use mocked FPL responses, including a simulated 50,000-manager league (ret
 main.py          Bot entry point and command handlers
 fpl_client.py    Async FPL API client (User-Agent, retries, cache)
 league.py        League scope, squad/chip snapshots, analysis and report formatting
+live.py          Live scores, auto-subs, projections, /livewinprob and /roundprize
+predict.py       Chip prediction
+alerts.py        Background transfer and rank alerts, housekeeping
 db.py            SQLite schema and helpers, subscription check
 config.py        Settings loaded from .env
 tests/           Unit tests
@@ -112,9 +132,8 @@ tests/           Unit tests
 
 ## Deploying to a server
 
-Run it as a `systemd` service (see section 10 of the build spec) so it restarts on crash or reboot. Keep `.env` on the server and out of git.
+Alerts only fire while the bot process is running, so run it as a `systemd` service (see section 10 of the build spec) so it restarts on crash or reboot. Keep `.env` on the server and out of git.
 
 ## Roadmap
 
-- Phase 3: live win probability, transfer alerts, chip prediction
 - Phase 4: Telegram Stars payments, free/paid gating, `/upgrade`

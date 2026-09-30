@@ -45,6 +45,7 @@ class Scope:
     league_name: str
     me: Member | None
     members: list[Member]  # top N + neighbours around me, sorted by rank (me included)
+    start_event: int = 1  # first gameweek this league counts points from
 
 
 @dataclass
@@ -52,6 +53,8 @@ class Snapshot:
     picks: list[dict]
     chips: list[dict]  # chips used so far (from entry/{id}/history/)
     active_chip: str | None = None
+    entry_history: dict | None = None  # picks response "entry_history" (transfer cost etc.)
+    history_current: list | None = None  # per-GW totals from history/ (used for live totals)
 
 
 def _member(r: dict) -> Member:
@@ -144,7 +147,7 @@ async def find_scope(fpl: FPLClient, league_id: int, my_team_id: int,
         me = chosen[my_team_id]
 
     members = sorted(chosen.values(), key=lambda m: m.rank)
-    return Scope(league_id, name, me, members)
+    return Scope(league_id, name, me, members, first["league"].get("start_event") or 1)
 
 
 # ----------------------------------------------------------- squads & chips
@@ -166,23 +169,44 @@ async def _picks_with_fallback(fpl: FPLClient, team_id: int, gw: int) -> dict:
 
 
 async def load_snapshot(fpl: FPLClient, league_id: int, team_id: int, gw: int,
-                        db_path: str | None = None) -> Snapshot:
+                        db_path: str | None = None, need_history: bool = True) -> Snapshot:
+    """Squad (+ chip/points history) for one manager, cached in SQLite.
+
+    need_history=False fetches picks only (half the API calls, used by /roundprize); such rows are
+    stored with chips_used_json = 'null' and upgraded on demand if a caller later needs history.
+    """
     row = db.get_snapshot(league_id, team_id, gw, db_path)
+    hist = None
     if row and _fresh(row["fetched_at"]):
-        data = json.loads(row["squad_json"])
-        return Snapshot(data["picks"], json.loads(row["chips_used_json"]), data.get("active_chip"))
-    picks_data, hist = await asyncio.gather(_picks_with_fallback(fpl, team_id, gw), fpl.history(team_id))
-    chips = hist.get("chips", [])
+        picks_data = json.loads(row["squad_json"])
+        chips = json.loads(row["chips_used_json"])
+        if chips is not None or not need_history:
+            return _to_snapshot(picks_data, chips)
+        hist = await fpl.history(team_id)  # upgrade a picks-only row
+    elif need_history:
+        picks_data, hist = await asyncio.gather(_picks_with_fallback(fpl, team_id, gw), fpl.history(team_id))
+    else:
+        picks_data = await _picks_with_fallback(fpl, team_id, gw)
+    chips = None
+    if hist is not None:
+        chips = hist.get("chips", [])
+        picks_data = {**picks_data, "history_current": hist.get("current", [])}
     db.save_snapshot(league_id, team_id, gw, json.dumps(picks_data), json.dumps(chips), db_path)
-    return Snapshot(picks_data["picks"], chips, picks_data.get("active_chip"))
+    return _to_snapshot(picks_data, chips)
+
+
+def _to_snapshot(picks_data: dict, chips: list | None) -> Snapshot:
+    return Snapshot(picks_data["picks"], chips or [], picks_data.get("active_chip"),
+                    picks_data.get("entry_history") or {}, picks_data.get("history_current") or [])
 
 
 async def gather_snapshots(fpl: FPLClient, scope: Scope, gw: int,
-                           db_path: str | None = None) -> tuple[dict[int, Snapshot], int]:
+                           db_path: str | None = None,
+                           need_history: bool = True) -> tuple[dict[int, Snapshot], int]:
     """Fetch squads+chips for the sampled members (concurrency is capped inside FPLClient)."""
     ids = [m.entry for m in scope.members]
     results = await asyncio.gather(
-        *(load_snapshot(fpl, scope.league_id, i, gw, db_path) for i in ids), return_exceptions=True
+        *(load_snapshot(fpl, scope.league_id, i, gw, db_path, need_history) for i in ids), return_exceptions=True
     )
     snaps, failed = {}, 0
     for i, res in zip(ids, results):
@@ -360,3 +384,18 @@ def compare_squads(my_picks: list[dict], their_picks: list[dict], players: dict,
         f"<b>Only you own</b>\n{fmt(mine - theirs)}",
         f"<b>Only {lab} owns</b>\n{fmt(theirs - mine)}",
     ]
+
+
+async def top_members(fpl: FPLClient, league_id: int, n: int) -> Scope:
+    """Top-N managers by league rank only (n > 50 fetches extra standings pages, 50 per page)."""
+    n = max(1, n)
+    first = await fpl.standings(league_id, 1)
+    rows = list(first["standings"]["results"])
+    page, has_next = 1, first["standings"].get("has_next")
+    while len(rows) < n and has_next:
+        page += 1
+        data = await fpl.standings(league_id, page)
+        rows += data["standings"]["results"]
+        has_next = data["standings"].get("has_next")
+    members = [_member(r) for r in rows[:n]]
+    return Scope(league_id, first["league"]["name"], None, members, first["league"].get("start_event") or 1)

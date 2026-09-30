@@ -29,6 +29,7 @@ class FPLClient:
             follow_redirects=True,
         )
         self._sem = asyncio.Semaphore(config.MAX_CONCURRENCY)
+        self._cache: dict[str, tuple[float, object]] = {}
         self._standings_cache: dict[tuple[int, int], tuple[float, dict]] = {}
         self._bootstrap: dict | None = None
         self._bootstrap_at = 0.0
@@ -99,3 +100,30 @@ class FPLClient:
         data = await self._get(f"leagues-classic/{league_id}/standings/?page_standings={page}")
         self._standings_cache[key] = (time.time(), data)
         return data
+
+    async def _cached(self, path: str, ttl: float):
+        hit = self._cache.get(path)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+        try:
+            data = await self._get(path)
+        except FPLError:
+            if hit:  # serve stale rather than fail mid-gameweek
+                log.warning("Serving stale %s", path)
+                return hit[1]
+            raise
+        self._cache[path] = (time.time(), data)
+        return data
+
+    async def live(self, gw: int) -> dict:
+        """In-match points for every player this gameweek (cached 2 minutes to respect rate limits)."""
+        return await self._cached(f"event/{gw}/live/", config.LIVE_TTL_SECONDS)
+
+    async def fixtures(self, event: int | None = None) -> list:
+        """Fixtures for one gameweek (short cache, includes live minutes) or the whole season (1h cache)."""
+        if event is None:
+            return await self._cached("fixtures/", config.BOOTSTRAP_TTL_SECONDS)
+        return await self._cached(f"fixtures/?event={event}", config.LIVE_TTL_SECONDS)
+
+    async def transfers(self, team_id: int) -> list:
+        return await self._get(f"entry/{team_id}/transfers/")
