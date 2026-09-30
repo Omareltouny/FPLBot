@@ -28,6 +28,8 @@ class FPLClient:
             timeout=15.0,
             follow_redirects=True,
         )
+        self._sem = asyncio.Semaphore(config.MAX_CONCURRENCY)
+        self._standings_cache: dict[tuple[int, int], tuple[float, dict]] = {}
         self._bootstrap: dict | None = None
         self._bootstrap_at = 0.0
 
@@ -38,7 +40,8 @@ class FPLClient:
         last_exc: Exception | None = None
         for attempt in range(self.retries):
             try:
-                resp = await self._client.get(path)
+                async with self._sem:
+                    resp = await self._client.get(path)
                 if resp.status_code == 404:
                     raise FPLNotFound(path)
                 if resp.status_code in (429, 500, 502, 503, 504):
@@ -86,3 +89,13 @@ class FPLClient:
 
     async def picks(self, team_id: int, gw: int) -> dict:
         return await self._get(f"entry/{team_id}/event/{gw}/picks/")
+
+    async def standings(self, league_id: int, page: int = 1) -> dict:
+        """One page (50 managers) of a classic league. Cached briefly."""
+        key = (league_id, page)
+        hit = self._standings_cache.get(key)
+        if hit and time.time() - hit[0] < config.STANDINGS_TTL_SECONDS:
+            return hit[1]
+        data = await self._get(f"leagues-classic/{league_id}/standings/?page_standings={page}")
+        self._standings_cache[key] = (time.time(), data)
+        return data
